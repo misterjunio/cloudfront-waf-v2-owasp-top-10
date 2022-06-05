@@ -1,0 +1,12 @@
+{
+    "Parameters": {
+        "pCodeCommitRepoName": "misterjunio-waf-v2-repo",
+        "pCodeCommitUserName": "MisterJunioWAFV2CodeCommitUser",
+        "pCodePipelineName": "misterjunio-waf-v2-pipeline",
+        "pMainStackName": "misterjunio-waf-v2-main-stack",
+        "pWafStackArtifactsS3BucketName": "misterjunio-waf-v2-waf-stack-artifacts-bucket",
+        "pWafStackName": "misterjunio-waf-v2-waf-stack"
+    },
+    "StackPolicy": {},
+    "Tags": {}
+}

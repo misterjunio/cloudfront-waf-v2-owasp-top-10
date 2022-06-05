@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: This template defines a Custom Resource (to retrieve the ARN of a global WAF Web ACL), and a CloudFront distribution to which the ACL is attached.
+
+Parameters:
+  pS3BucketName:
+    Description: Name for the S3 bucket that's the origin of the CloudFront distribution.
+    Type: String
+
+Resources:
+  # IAM role for the WAF Web ACL Custom Resource backing Lambda
+  WafWebAclCustomResourceLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: WafWebAclLambdaCustomResourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ['logs:*']
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action: ['wafv2:ListWebACLs']
+                Resource: 'arn:aws:wafv2:*'
+
+  # Permissions for CloudFormation to invoke the WAF Web ACL Custom Resource backing Lambda
+  CloudFormationLambdaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt WafWebAclCustomResourceLambdaFunction.Arn
+      Principal: 'cloudformation.amazonaws.com'
+
+  # WAF Web ACL Custom Resource backing Lambda function
+  WafWebAclCustomResourceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+
+          wafClient = boto3.client('wafv2', region_name='us-east-1')
+
+          def handler(event, context):
+            print(json.dumps(event))
+            responseData = {}
+            try:
+                # for Delete requests, immediately send a SUCCESS response
+                if (event['RequestType'] == 'Delete'):
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                    responseData, 'WafWebAclCustomResource')
+                # retrieve all web ACLs
+                wafWebAclsResponse = wafClient.list_web_acls(Scope='CLOUDFRONT')
+                print(json.dumps(wafWebAclsResponse))
+                # filter for our intended one by name
+                wafWebAcl = next(
+                    (acl for acl in wafWebAclsResponse['WebACLs'] if acl['Name'] == 'owasp-top10-waf-v2-acl'), None)
+                print(json.dumps(wafWebAcl))
+                if wafWebAcl is None:
+                    # if not found, return failure
+                    responseData['Error'] = 'Could not retrieve OWASP Top 10 WAF ACL(name should be `owasp-top10-waf-v2-acl`)'
+                    cfnresponse.send(event, context, cfnresponse.FAILURE,
+                                    responseData, 'WafWebAclCustomResource')
+                else:
+                    # return ACL ARN
+                    responseData['WebAclArn'] = wafWebAcl['ARN']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                    responseData, 'WafWebAclCustomResource')
+            except BaseException as exception:
+                responseData['Error'] = json.dumps(exception)
+                cfnresponse.send(event, context, cfnresponse.FAILURE,
+                                responseData, 'WafWebAclCustomResource')
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 10
+      Role: !GetAtt WafWebAclCustomResourceLambdaExecutionRole.Arn
+
+  # WAF Web ACL Custom Resource
+  WafWebAclCustomResource:
+    Type: Custom::WafWebAcl
+    Properties:
+      ServiceToken: !GetAtt WafWebAclCustomResourceLambdaFunction.Arn
+
+  # S3 bucket to act as CloudFront origin
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref pS3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+
+  # CloudFront OAI
+  WebCDNAccessID:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Access to S3 bucket only through CDN
+
+  # CloudFront distribution
+  WebCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub CDN for OWASP Top 10 WAF v2 example
+        Origins:
+          - S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${WebCDNAccessID}
+            DomainName: !GetAtt S3Bucket.DomainName
+            Id: !Ref S3Bucket
+        Enabled: true
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          AllowedMethods: ['HEAD', 'GET']
+          DefaultTTL: 86400 # One day
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+          TargetOriginId: !Ref S3Bucket
+          ViewerProtocolPolicy: redirect-to-https
+        WebACLId: !GetAtt WafWebAclCustomResource.WebAclArn

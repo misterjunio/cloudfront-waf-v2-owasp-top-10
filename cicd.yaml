@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This template defines a pipeline for deploying a WAF v2 global resource, followed by a CloudFront distribution to which the WAF is attached.
+
+Parameters:
+  pCodeCommitRepoName:
+    Description: Name for the CodeCommit repo.
+    Type: String
+  pCodeCommitUserName:
+    Description: Name of the IAM user to create for interacting with the CodeCommit repository.
+    Type: String
+  pCodePipelineName:
+    Description: Name for the pipeline in CodePipeline.
+    Type: String
+  pMainStackName:
+    Description: Name for the CloudFormation stack which will define the main resources (such as the CloudFront distribution).
+    Type: String
+  pWafStackArtifactsS3BucketName:
+    Description: Name of an S3 Bucket that must exist in us-east-1, which will hold the WAF stack artifacts.
+    Type: String
+  pWafStackName:
+    Description: Name for the CloudFormation stack which will define the WAF resource.
+    Type: String
+
+Resources:
+  # CodeCommit repo.
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref pCodeCommitRepoName
+      RepositoryDescription: Repo to hold solution for WAF v2 attachment to a CloudFront distribution in a separate region.
+
+  # CodeCommit user. Follow https://docs.aws.amazon.com/codecommit/latest/userguide/setting-up-gc.html to setup Git access to the CodeCommit repo for this user.
+  # Beware that after you create CodeCommit credentials, the user can no longer be deleted by this stack. Therefore for safety we're retaining this user on stack deletion.
+  CodeCommitUser:
+    Type: AWS::IAM::User
+    DeletionPolicy: Retain # Stack deletion fails if the user has CodeCommit credentials generated in the meantime.
+    Properties:
+      UserName: !Ref pCodeCommitUserName
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeCommitPowerUser'
+
+  # IAM roles for CodePipeline and CloudFormation
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codepipeline.amazonaws.com]
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 'iam:PassRole'
+                  - 'codecommit:Get*'
+                  - 'codecommit:UploadArchive'
+                  - 'codecommit:CancelUploadArchive'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:SetStackPolicy'
+                  - 'lambda:InvokeFunction'
+                  - 'sns:Publish'
+                Effect: Allow
+                Resource: '*'
+  CloudFormationPipelineStackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [cloudformation.amazonaws.com]
+      Policies:
+        - PolicyName: CloudFormationPipelineStackAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: '*'
+                Effect: Allow
+                Resource: '*'
+  CloudFormationWafStackRole:
+    Type: 'AWS::IAM::Role'
+    DeletionPolicy: Retain # If the pipeline stack is deleted, the CodePipeline will be deleted but the WAF stack created in the other region will not. We should retain this role in order to delete that stack.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [cloudformation.amazonaws.com]
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AWSWAFFullAccess'
+  CloudFormationMainStackRole:
+    Type: 'AWS::IAM::Role'
+    DeletionPolicy: Retain # If the pipeline stack is deleted, the CodePipeline will be deleted but the main stack will not. We should retain this role in order to delete that stack.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [cloudformation.amazonaws.com]
+      Policies:
+        - PolicyName: CloudFormationMainStackAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: '*'
+                Effect: Allow
+                Resource: '*'
+
+  # S3 bucket to hold CodePipeline artifacts.
+  PipelineStackArtifactStoreBucket:
+    DeletionPolicy: Retain # Ensure stack deletion does not fail since the S3 bucket would not be empty. Bucket can be deleted separately.
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  # CodePipeline pipeline.
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStores:
+        - ArtifactStore:
+            Type: S3
+            Location: !Ref PipelineStackArtifactStoreBucket
+          Region: !Ref AWS::Region
+        - ArtifactStore:
+            Type: S3
+            Location: !Ref pWafStackArtifactsS3BucketName
+          Region: us-east-1
+      Name: !Ref pCodePipelineName
+      RoleArn: !GetAtt [CodePipelineRole, Arn]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommit
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                BranchName: main
+                RepositoryName: !GetAtt Repository.Name
+              OutputArtifacts:
+                - Name: TemplateSource
+              RunOrder: 1
+        - Name: Deploy-Stacks
+          Actions:
+            - Name: Deploy-Pipeline-Stack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt [CloudFormationPipelineStackRole, Arn]
+                StackName: !Ref AWS::StackName
+                ChangeSetName: Pipeline-Stack-Update
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: TemplateSource::cicd.yaml
+                TemplateConfiguration: TemplateSource::parameters/cicd.json
+              RunOrder: 10
+            - Name: Deploy-WAF-Stack
+              Region: us-east-1 # Must be in N. Virginia for a CloudFront WAF v2.
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt [CloudFormationWafStackRole, Arn]
+                StackName: !Ref pWafStackName
+                ChangeSetName: WAF-Stack-Update
+                TemplatePath: TemplateSource::waf-v2-owasp-top-10.yaml
+                TemplateConfiguration: TemplateSource::parameters/waf-v2-owasp-top-10.json
+              RunOrder: 10
+            - Name: Deploy-Main-Stack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt [CloudFormationMainStackRole, Arn]
+                StackName: !Ref pMainStackName
+                Capabilities: CAPABILITY_NAMED_IAM
+                ChangeSetName: Main-Stack-Update
+                TemplatePath: TemplateSource::main.yaml
+                TemplateConfiguration: TemplateSource::parameters/main.json
+              RunOrder: 20
+
+Outputs:
+  PipelineStackArtifactStoreBucket:
+    Description: S3 Bucket that holds the pipeline stack artifacts
+    Value: !Ref PipelineStackArtifactStoreBucket
+  CodePipelineRole:
+    Description: Service role used by CodePipeline
+    Value: !Ref CodePipelineRole
+  CloudFormationPipelineStackRole:
+    Description: Service role used by CloudFormation to deploy the pipeline stack
+    Value: !Ref CloudFormationPipelineStackRole
+  CloudFormationWafStackRole:
+    Description: Service role used by CloudFormation to deploy the WAF stack
+    Value: !Ref CloudFormationWafStackRole
+  CloudFormationMainStackRole:
+    Description: Service role used by CloudFormation to deploy the main stack
+    Value: !Ref CloudFormationMainStackRole

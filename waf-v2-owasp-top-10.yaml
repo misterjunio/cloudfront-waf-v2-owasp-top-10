@@ -1,0 +1,682 @@
+---
+## Inspired by the archived sample in https://github.com/amazon-archives/aws-waf-sample/tree/master/waf-owasp-top-10, which
+## used the Classic WAF, I created this template for implementing the same set of rules to cover OWASP's Top 10
+## Web Application Vulnerabilities, but in the most recent AWS WAF (v2) and only for a (global) CloudFront target.
+##
+## SPDX-License-Identifier: MIT
+##
+## Repository:
+## https://github.com/misterjunio/cloudfront-waf-v2-owasp-top-10
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: AWS WAF (v2) OWASP Top 10 Vulnerability Rules Set
+
+## ::PARAMETERS::
+## Template parameters to be configured
+Parameters:
+  pStackPrefix:
+    Type: String
+    Description: The prefix to use when naming resources in this stack. Normally we would use the stack name, but since this template can be used as a resource in other stacks we want to keep the naming consistent. No symbols allowed.
+    ConstraintDescription: Alphanumeric characters only, maximum 10 characters
+    AllowedPattern: ^[a-zA-z0-9]+$
+    MaxLength: 15
+  pRuleAction:
+    Type: String
+    Description: The type of action you want to implement for the rules in this set. Valid options are COUNT or BLOCK.
+    AllowedValues:
+      - BLOCK
+      - COUNT
+    Default: BLOCK
+  pIncludesPrefix:
+    Type: String
+    Description: This is the URI path prefix (starting with '/') that identifies any files in your webroot that are server-side included components, and should not be invoked directly via URL. These can be headers, footers, 3rd party server side libraries or components. You can add additional prefixes later directly in the set.
+    Default: /includes
+  pAdminUrlPrefix:
+    Type: String
+    Description: This is the URI path prefix (starting with '/') that identifies your administrative sub-site. You can add additional prefixes later directly in the set.
+    Default: /admin
+  pAdminRemoteCidr:
+    Type: String
+    Description: This is the IP address allowed to access your administrative interface. Use CIDR notation. You can add additional ones later directly in the set.
+    Default: 127.0.0.1/32
+  pMaxExpectedURISize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the URI component of the HTTP request. Generally the maximum possible value is determined by the server operating system (maps to file system paths), the web server software, or other middleware components. Choose a value that accomodates the largest URI segment you use in practice in your web application.
+    Default: 512
+  pMaxExpectedQueryStringSize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the query string component of the HTTP request. Normally the  of query string parameters following the "?" in a URL is much larger than the URI , but still bounded by the  of the parameters your web application uses and their values.
+    Default: 1024
+  pMaxExpectedBodySize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the body of the request. If you do not plan to allow large uploads, set it to the largest payload value that makes sense for your web application. Accepting unnecessarily large values can cause performance issues, if large payloads are used as an attack vector against your web application.
+    Default: 4096
+  pMaxExpectedCookieSize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the cookie header. The maximum size should be less than 4096, the size is determined by the amount of information your web application stores in cookies. If you only pass a session token via cookies, set the size to no larger than the serialized size of the session token and cookie metadata.
+    Default: 4093
+  pCsrfExpectedHeader:
+    Type: String
+    Description: The custom HTTP request header, where the CSRF token value is expected to be encountered
+    Default: x-csrf-token
+  pCsrfExpectedSize:
+    Type: Number
+    Description: The size in bytes of the CSRF token value. For example if it's a canonically formatted UUIDv4 value the expected size would be 36 bytes/ASCII characters
+    Default: 36
+
+## ::METADATA::
+## CloudFormation parameter UI definitions
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Resource Prefix
+        Parameters:
+          - pStackPrefix
+      - Label:
+          default: WAF Implementation
+        Parameters:
+          - pRuleAction
+      - Label:
+          default: Generic HTTP Request Enforcement
+        Parameters:
+          - pMaxExpectedURISize
+          - pMaxExpectedQueryStringSize
+          - pMaxExpectedBodySize
+          - pMaxExpectedCookieSize
+      - Label:
+          default: Administrative Interface
+        Parameters:
+          - pAdminUrlPrefix
+          - pAdminRemoteCidr
+      - Label:
+          default: Cross-Site Request Forgery (CSRF)
+        Parameters:
+          - pCsrfExpectedHeader
+          - pCsrfExpectedSize
+      - Label:
+          default: Application Specific
+        Parameters:
+          - pIncludesPrefix
+    ParameterLabels:
+      pStackPrefix:
+        default: Resource Name Prefix
+      pRuleAction:
+        default: Rule Effect
+      pIncludesPrefix:
+        default: Server-side components URI prefix
+      pAdminUrlPrefix:
+        default: URI prefix
+      pAdminRemoteCidr:
+        default: Allowed IP source (CIDR)
+      pMaxExpectedURISize:
+        default: Max. size of URI
+      pMaxExpectedQueryStringSize:
+        default: Max. size of QUERY STRING
+      pMaxExpectedBodySize:
+        default: Max. size of BODY
+      pMaxExpectedCookieSize:
+        default: Max. size of COOKIE
+      pCsrfExpectedHeader:
+        default: HTTP Request Header
+      pCsrfExpectedSize:
+        default: Token Size
+
+## ::RESOURCES::
+## Resources used in this solution
+Resources:
+  ## IP Set used for Rule A05
+  wafAdminRemoteAddrIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Join ['-', [!Ref pStackPrefix, 'admin-ip-set']]
+      Description: 'IP Set allowed through for admin operations'
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses:
+        - !Ref pAdminRemoteCidr
+
+  ## IP Set used for Rule A10
+  wafBlacklistIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Join ['-', [!Ref pStackPrefix, 'blacklisted-ip-set']]
+      Description: 'IP Set blacklisted from access'
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses:
+        - 10.0.0.0/8
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 172.16.0.0/16
+        - 127.0.0.1/32
+
+  ## WebACL containing the rules
+  wafOwaspACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: owasp-top10-waf-v2-acl
+      Description: WebACL associated with the WAF, following the OWASP Top 10 rules.
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !Join ['', [!Ref pStackPrefix, 'owaspAcl']]
+      Rules:
+        ## OWASP Top 10 A01
+        ## Mitigate SQL Injection Attacks
+        ## Matches attempted SQLi patterns in the URI, QUERY_STRING, BODY, COOKIES
+        - Name: !Join ['-', [!Ref pStackPrefix, 'mitigate-sqli']]
+          Priority: 40
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'mitigateSqli']]
+          Statement:
+            OrStatement:
+              Statements:
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      Body: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: cookie
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+
+        ## OWASP Top 10 A02
+        ## Blacklist bad/hijacked JWT tokens or session IDs
+        ## Matches the specific values in the cookie or Authorization header
+        ## for JWT it is sufficient to check the signature
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-bad-auth-tokens']]
+          Priority: 30
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'badAuthTokens']]
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: cookie
+                    PositionalConstraint: CONTAINS
+                    SearchString: example-session-id
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: authorization
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ
+                    TextTransformations:
+                      - Priority: 20
+                        Type: URL_DECODE
+
+        ## OWASP Top 10 A03
+        ## Mitigate Cross Site Scripting Attacks
+        ## Matches attempted XSS patterns in the URI, QUERY_STRING, BODY, COOKIES
+        - Name: !Join ['-', [!Ref pStackPrefix, 'mitigate-xss']]
+          Priority: 50
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'mitigateXss']]
+          Statement:
+            OrStatement:
+              Statements:
+                - XssMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - XssMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - XssMatchStatement:
+                    FieldToMatch:
+                      Body: {}
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - XssMatchStatement:
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: cookie
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+
+        ## OWASP Top 10 A04
+        ## Path Traversal, LFI, RFI
+        ## Matches request patterns designed to traverse filesystem paths, and include
+        ## local or remote files
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-rfi-lfi-traversal']]
+          Priority: 60
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'detectRfiLfi']]
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: ../
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: ../
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: ://
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: ://
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                      - Priority: 20
+                        Type: HTML_ENTITY_DECODE
+
+        ## OWASP Top 10 A05
+        ## Privileged Module Access Restrictions
+        ## Restrict access to the admin interface to known source IPs only
+        ## Matches the URI prefix, when the remote IP isn't in the whitelist
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-admin-access']]
+          Priority: 100
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'detectAdminAccess']]
+          Statement:
+            AndStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: STARTS_WITH
+                    SearchString: !Ref pAdminUrlPrefix
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - NotStatement:
+                    Statement:
+                      IPSetReferenceStatement:
+                        Arn: !GetAtt wafAdminRemoteAddrIpSet.Arn
+
+        ## OWASP Top 10 A06
+        ## PHP Specific Security Misconfigurations
+        ## Matches request patterns designed to exploit insecure PHP/CGI configuration
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-php-insecure']]
+          Priority: 70
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'detectPhpInsecure']]
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: _SERVER[
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: _ENV[
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: auto_prepend_file=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: auto_append_file=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: allow_url_include=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: disable_functions=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: open_basedir=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    PositionalConstraint: CONTAINS
+                    SearchString: safe_mode=
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: php
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: /
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+
+        ## OWASP Top 10 A07
+        ## Mitigate abnormal requests via size restrictions
+        ## Enforce consistent request hygiene, limit size of key elements
+        - Name: !Join ['-', [!Ref pStackPrefix, 'restrict-sizes']]
+          Priority: 10
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'restrictSizes']]
+          Statement:
+            OrStatement:
+              Statements:
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    ComparisonOperator: GT
+                    Size: !Ref pMaxExpectedURISize
+                    TextTransformations:
+                      - Priority: 10
+                        Type: NONE
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    ComparisonOperator: GT
+                    Size: !Ref pMaxExpectedQueryStringSize
+                    TextTransformations:
+                      - Priority: 10
+                        Type: NONE
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      Body: {}
+                    ComparisonOperator: GT
+                    Size: !Ref pMaxExpectedBodySize
+                    TextTransformations:
+                      - Priority: 10
+                        Type: NONE
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: cookie
+                    ComparisonOperator: GT
+                    Size: !Ref pMaxExpectedCookieSize
+                    TextTransformations:
+                      - Priority: 10
+                        Type: NONE
+
+        ## OWASP Top 10 A08
+        ## CSRF token enforcement example
+        ## Enforce the presence of CSRF token in request header
+        - Name: !Join ['-', [!Ref pStackPrefix, 'enforce-csrf']]
+          Priority: 80
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'enforceCsrf']]
+          Statement:
+            AndStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      Method: {}
+                    PositionalConstraint: EXACTLY
+                    SearchString: post
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - NotStatement:
+                    Statement:
+                      SizeConstraintStatement:
+                        FieldToMatch:
+                          SingleHeader:
+                            Name: !Ref pCsrfExpectedHeader
+                        ComparisonOperator: EQ
+                        Size: !Ref pCsrfExpectedSize
+                        TextTransformations:
+                          - Priority: 10
+                            Type: NONE
+
+        ## OWASP Top 10 A09
+        ## Server-side includes & libraries in webroot
+        ## Matches request patterns for webroot objects that shouldn't be directly accessible
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-ssi']]
+          Priority: 90
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'detectSsi']]
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: STARTS_WITH
+                    SearchString: !Ref pIncludesPrefix
+                    TextTransformations:
+                      - Priority: 10
+                        Type: URL_DECODE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .cfg
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .conf
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .config
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .ini
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .log
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .bak
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    FieldToMatch:
+                      UriPath: {}
+                    PositionalConstraint: ENDS_WITH
+                    SearchString: .backup
+                    TextTransformations:
+                      - Priority: 10
+                        Type: LOWERCASE
+
+        ## OWASP Top 10 A10 (Generic)
+        ## IP Blacklist
+        ## Matches IP addresses that should not be allowed to access content
+        - Name: !Join ['-', [!Ref pStackPrefix, 'detect-blacklisted-ips']]
+          Priority: 20
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: !Join ['', [!Ref pStackPrefix, 'blacklistedIps']]
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt wafBlacklistIpSet.Arn
+
+## ::OUTPUTS::
+## Outputs that may be useful
+Outputs:
+  wafWebACLMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'owaspAcl']]
+  wafSQLiRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'mitigateSqli']]
+  wafAuthTokenRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'badAuthTokens']]
+  wafXSSRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'mitigateXss']]
+  wafPathsRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'detectRfiLfi']]
+  wafPHPMisconfigRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'detectPhpInsecure']]
+  wafAdminAccessRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'detectAdminAccess']]
+  wafCSRFRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'enforceCsrf']]
+  wafSSIRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'detectSsi']]
+  wafBlacklistIpRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'blacklistedIps']]
+  wafSizeRestrictionRuleMetric:
+    Value: !Join ['', [!Ref pStackPrefix, 'restrictSizes']]
+  wafAdminAccessWhitelist:
+    Value: !Ref wafAdminRemoteAddrIpSet
+  wafIpBlacklist:
+    Value: !Ref wafBlacklistIpSet

@@ -1,0 +1,7 @@
+{
+    "Parameters": {
+        "pS3BucketName": "misterjunio-waf-v2-test-bucket"
+    },
+    "StackPolicy": {},
+    "Tags": {}
+}
